@@ -1,6 +1,6 @@
 import { Err, Ok, Result } from '@hqoss/monads';
 import axios, { AxiosError } from 'axios';
-import { array, object, string } from 'decoders';
+import { array, object, string, nullable, number } from 'decoders';
 import settings from '../config/settings';
 import {
   Article,
@@ -15,7 +15,7 @@ import { Comment, commentDecoder } from '../types/comment';
 import { GenericErrors, genericErrorsDecoder } from '../types/error';
 import { objectToQueryString } from '../types/object';
 import { Profile, profileDecoder } from '../types/profile';
-import { User, userDecoder, UserForRegistration, UserSettings } from '../types/user';
+import { PublicUser, User, userDecoder, UserForRegistration, UserSettings } from '../types/user';
 
 axios.defaults.baseURL = settings.baseApiUrl;
 
@@ -115,6 +115,15 @@ export async function unfollowUser(username: string): Promise<Profile> {
   return object({ profile: profileDecoder }).verify(data).profile;
 }
 
+export async function getUsers(limit = 200, offset = 0): Promise<PublicUser[]> {
+  const { data } = await axios.get(`users?limit=${limit}&offset=${offset}`);
+  const decoded = object({
+    users: array(object({ username: string, bio: nullable(string), image: nullable(string) })),
+    usersCount: number,
+  }).verify(data);
+  return decoded.users;
+}
+
 export async function getFeed(filters: FeedFilters = {}): Promise<MultipleArticles> {
   const finalFilters: ArticlesFilters = {
     limit: 10,
@@ -140,4 +149,17 @@ export async function createComment(slug: string, body: string): Promise<Comment
 
 export async function deleteArticle(slug: string): Promise<void> {
   await axios.delete(`articles/${slug}`);
+}
+
+// Article edit lock API
+export async function acquireArticleLock(slug: string): Promise<void> {
+  await axios.post(`articles/${slug}/lock`);
+}
+
+export async function heartbeatArticleLock(slug: string): Promise<void> {
+  await axios.put(`articles/${slug}/lock/heartbeat`);
+}
+
+export async function releaseArticleLock(slug: string): Promise<void> {
+  await axios.delete(`articles/${slug}/lock`);
 }

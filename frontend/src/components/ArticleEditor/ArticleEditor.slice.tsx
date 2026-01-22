@@ -12,7 +12,7 @@ export interface EditorState {
 }
 
 const initialState: EditorState = {
-  article: { title: '', body: '', tagList: [], description: '' },
+  article: { title: '', body: '', tagList: [], description: '', coAuthors: [] },
   tag: '',
   submitting: false,
   errors: {},
@@ -26,7 +26,7 @@ const slice = createSlice({
     initializeEditor: () => initialState,
     updateField: (
       state,
-      { payload: { name, value } }: PayloadAction<{ name: keyof EditorState['article'] | 'tag'; value: string }>,
+      { payload: { name, value } }: PayloadAction<{ name: keyof EditorState['article'] | 'tag'; value: any }>,
     ) => {
       if (name === 'tag') {
         state.tag = value;
@@ -34,7 +34,8 @@ const slice = createSlice({
       }
 
       if (name !== 'tagList') {
-        state.article[name] = value;
+        // allow coAuthors: string[] assignment too
+        (state.article as any)[name] = value as any;
       }
     },
     updateErrors: (state, { payload: errors }: PayloadAction<GenericErrors>) => {
@@ -57,10 +58,13 @@ const slice = createSlice({
       state.article = article;
       state.loading = false;
     },
+    setCoAuthors: (state, { payload }: PayloadAction<string[]>) => {
+      state.article.coAuthors = payload;
+    },
   },
 });
 
-export const { initializeEditor, updateField, startSubmitting, addTag, removeTag, updateErrors, loadArticle } =
+export const { initializeEditor, updateField, startSubmitting, addTag, removeTag, updateErrors, loadArticle, setCoAuthors } =
   slice.actions;
 
 export default slice.reducer;

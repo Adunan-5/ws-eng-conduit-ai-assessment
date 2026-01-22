@@ -108,18 +108,32 @@ function ArticleMeta({
   metaSection: MetaSectionState;
   user: User | null;
 }) {
+  const isAuthor = !!user && user.username === article.author.username;
+  const isCoAuthor = !!user && (article.coAuthors || []).some((p) => p.username === user.username);
+
   return (
     <div className='article-meta'>
       <ArticleAuthorInfo article={article} />
 
-      {user && user.username === article.author.username ? (
+      {isAuthor ? (
         <OwnerArticleMetaActions article={article} deletingArticle={deletingArticle} />
       ) : (
-        <NonOwnerArticleMetaActions
-          article={article}
-          submittingFavorite={submittingFavorite}
-          submittingFollow={submittingFollow}
-        />
+        <Fragment>
+          {isCoAuthor && (
+            <Fragment>
+              <button className='btn btn-outline-secondary btn-sm' onClick={() => redirect(`editor/${article.slug}`)}>
+                <i className='ion-plus-round'></i>
+                &nbsp; Edit Article
+              </button>
+              &nbsp;
+            </Fragment>
+          )}
+          <NonOwnerArticleMetaActions
+            article={article}
+            submittingFavorite={submittingFavorite}
+            submittingFollow={submittingFollow}
+          />
+        </Fragment>
       )}
     </div>
   );

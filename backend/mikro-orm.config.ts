@@ -10,10 +10,13 @@ import { User } from './src/user/user.entity';
 import { Tag } from './src/tag/tag.entity';
 import { Article } from './src/article/article.entity';
 import { Comment } from './src/article/comment.entity';
+import { ArticleEditLock } from './src/article/article-edit-lock.entity';
 import { InitialMigration } from './src/migrations/InitialMigration';
+import { AddArticleCoauthors } from './src/migrations/AddArticleCoauthors';
+import { AddArticleEditLock } from './src/migrations/AddArticleEditLock';
 
 export default defineConfig({
-  host: 'db',
+  host: '127.0.0.1',
   port: 3306,
   user: 'conduit',
   password: 'conduit',
@@ -24,9 +27,17 @@ export default defineConfig({
         name: 'InitialMigration',
         class: InitialMigration,
       },
+      {
+        name: 'AddArticleCoauthors',
+        class: AddArticleCoauthors,
+      },
+      {
+        name: 'AddArticleEditLock',
+        class: AddArticleEditLock,
+      },
     ],
   },
-  entities: [User, Tag, Article, Comment],
+  entities: [User, Tag, Article, Comment, ArticleEditLock],
   discovery: { disableDynamicFileAccess: true },
   seeder: {
     pathTs: join(__dirname, 'src', 'seeders'),

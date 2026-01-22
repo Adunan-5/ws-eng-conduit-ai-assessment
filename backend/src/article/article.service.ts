@@ -1,13 +1,15 @@
 import { EntityManager, QueryOrder, wrap } from '@mikro-orm/core';
 import { EntityRepository } from '@mikro-orm/mysql';
 import { InjectRepository } from '@mikro-orm/nestjs';
-import { Injectable } from '@nestjs/common';
+import { Injectable, ForbiddenException, ConflictException } from '@nestjs/common';
 
 import { User } from '../user/user.entity';
 import { Article } from './article.entity';
 import { IArticleRO, IArticlesRO, ICommentsRO } from './article.interface';
 import { Comment } from './comment.entity';
 import { CreateArticleDto, CreateCommentDto } from './dto';
+import { ArticleEditLock } from './article-edit-lock.entity';
+import { LOCK_TIMEOUT_MS } from '../config';
 
 @Injectable()
 export class ArticleService {
@@ -19,6 +21,8 @@ export class ArticleService {
     private readonly commentRepository: EntityRepository<Comment>,
     @InjectRepository(User)
     private readonly userRepository: EntityRepository<User>,
+    @InjectRepository(ArticleEditLock)
+    private readonly lockRepository: EntityRepository<ArticleEditLock>,
   ) {}
 
   async findAll(userId: number, query: Record<string, string>): Promise<IArticlesRO> {
@@ -65,7 +69,7 @@ export class ArticleService {
     }
 
     const ids = (await qb.getResult()).map((a) => a.id);
-    const articles = await this.articleRepository.find({ id: { $in: ids } }, { populate: ['author'] });
+    const articles = await this.articleRepository.find({ id: { $in: ids } }, { populate: ['author', 'coAuthors'] });
     return { articles: articles.map((a) => a.toJSON(user!)), articlesCount };
   }
 
@@ -76,7 +80,7 @@ export class ArticleService {
     const res = await this.articleRepository.findAndCount(
       { author: { followers: userId } },
       {
-        populate: ['author'],
+        populate: ['author', 'coAuthors'],
         orderBy: { createdAt: QueryOrder.DESC },
         limit: +query.limit,
         offset: +query.offset,
@@ -91,12 +95,12 @@ export class ArticleService {
     const user = userId
       ? await this.userRepository.findOneOrFail(userId, { populate: ['followers', 'favorites'] })
       : undefined;
-    const article = await this.articleRepository.findOne(where, { populate: ['author'] });
+    const article = await this.articleRepository.findOne(where, { populate: ['author', 'coAuthors'] });
     return { article: article && article.toJSON(user) } as IArticleRO;
   }
 
   async addComment(userId: number, slug: string, dto: CreateCommentDto) {
-    const article = await this.articleRepository.findOneOrFail({ slug }, { populate: ['author'] });
+    const article = await this.articleRepository.findOneOrFail({ slug }, { populate: ['author', 'coAuthors'] });
     const author = await this.userRepository.findOneOrFail(userId);
     const comment = new Comment(author, article, dto.body);
     await this.em.persistAndFlush(comment);
@@ -105,7 +109,7 @@ export class ArticleService {
   }
 
   async deleteComment(userId: number, slug: string, id: number): Promise<IArticleRO> {
-    const article = await this.articleRepository.findOneOrFail({ slug }, { populate: ['author'] });
+    const article = await this.articleRepository.findOneOrFail({ slug }, { populate: ['author', 'coAuthors'] });
     const user = await this.userRepository.findOneOrFail(userId);
     const comment = this.commentRepository.getReference(id);
 
@@ -118,7 +122,7 @@ export class ArticleService {
   }
 
   async favorite(id: number, slug: string): Promise<IArticleRO> {
-    const article = await this.articleRepository.findOneOrFail({ slug }, { populate: ['author'] });
+    const article = await this.articleRepository.findOneOrFail({ slug }, { populate: ['author', 'coAuthors'] });
     const user = await this.userRepository.findOneOrFail(id, { populate: ['favorites', 'followers'] });
 
     if (!user.favorites.contains(article)) {
@@ -131,7 +135,7 @@ export class ArticleService {
   }
 
   async unFavorite(id: number, slug: string): Promise<IArticleRO> {
-    const article = await this.articleRepository.findOneOrFail({ slug }, { populate: ['author'] });
+    const article = await this.articleRepository.findOneOrFail({ slug }, { populate: ['author', 'coAuthors'] });
     const user = await this.userRepository.findOneOrFail(id, { populate: ['followers', 'favorites'] });
 
     if (user.favorites.contains(article)) {
@@ -155,25 +159,129 @@ export class ArticleService {
     );
     const article = new Article(user!, dto.title, dto.description, dto.body);
     article.tagList.push(...dto.tagList);
+
+    // attach co-authors if provided
+    if (dto.coAuthors && dto.coAuthors.length) {
+      const coAuthors = await this.userRepository.find({ username: { $in: dto.coAuthors } });
+      const filtered = coAuthors.filter((u) => u.id !== user!.id);
+      filtered.forEach((u) => article.coAuthors.add(u));
+    }
+
     user?.articles.add(article);
     await this.em.flush();
 
+    // ensure relations are loaded for JSON
+    await this.em.populate(article, ['author', 'coAuthors']);
     return { article: article.toJSON(user!) };
   }
 
-  async update(userId: number, slug: string, articleData: Partial<Article>): Promise<IArticleRO> {
+  async update(userId: number, slug: string, articleData: CreateArticleDto): Promise<IArticleRO> {
     const user = await this.userRepository.findOne(
       { id: userId },
       { populate: ['followers', 'favorites', 'articles'] },
     );
-    const article = await this.articleRepository.findOne({ slug }, { populate: ['author'] });
-    wrap(article).assign(articleData);
+    const article = await this.articleRepository.findOneOrFail({ slug }, { populate: ['author', 'coAuthors'] });
+
+    // enforce active lock ownership (if any and not expired)
+    const existingLock = await this.lockRepository.findOne({ article: article.id }, { populate: ['lockedBy'] });
+    if (existingLock) {
+      const expired = Date.now() - existingLock.lastSeenAt.getTime() > LOCK_TIMEOUT_MS;
+      if (!expired && existingLock.lockedBy.id !== userId) {
+        throw new ConflictException('Article is currently locked by another user');
+      }
+    }
+
+    // authorization: author or co-author
+    const isAuthor = article.author.id === userId;
+    const isCoAuthor = article.coAuthors.isInitialized() && article.coAuthors.getItems().some((u) => u.id === userId);
+    if (!isAuthor && !isCoAuthor) {
+      throw new ForbiddenException('You are not allowed to edit this article');
+    }
+
+    // assign basic fields (avoid coAuthors through assign)
+    const { coAuthors: coAuthorUsernames, ...rest } = articleData as any;
+    wrap(article).assign(rest);
+
+    // update co-authors if provided: replace set
+    if (coAuthorUsernames) {
+      const coAuthors = await this.userRepository.find({ username: { $in: coAuthorUsernames } });
+      const filtered = coAuthors.filter((u) => u.id !== article.author.id);
+      article.coAuthors.removeAll();
+      filtered.forEach((u) => article.coAuthors.add(u));
+    }
+
     await this.em.flush();
 
+    await this.em.populate(article, ['author', 'coAuthors']);
     return { article: article!.toJSON(user!) };
   }
 
   async delete(slug: string) {
     return this.articleRepository.nativeDelete({ slug });
+  }
+
+  // Locking methods
+  private isLockExpired(lock: ArticleEditLock): boolean {
+    return Date.now() - lock.lastSeenAt.getTime() > LOCK_TIMEOUT_MS;
+  }
+
+  async acquireLock(userId: number, slug: string) {
+    const article = await this.articleRepository.findOneOrFail({ slug });
+    let lock = await this.lockRepository.findOne({ article: article.id }, { populate: ['lockedBy'] });
+    const userRef = await this.userRepository.findOneOrFail(userId);
+
+    if (!lock) {
+      lock = new ArticleEditLock();
+      lock.article = article;
+      lock.lockedBy = userRef;
+      lock.lastSeenAt = new Date();
+      await this.em.persistAndFlush(lock);
+      return { ok: true };
+    }
+
+    if (this.isLockExpired(lock)) {
+      lock.lockedBy = userRef;
+      lock.lastSeenAt = new Date();
+      await this.em.flush();
+      return { ok: true };
+    }
+
+    if (lock.lockedBy.id === userId) {
+      lock.lastSeenAt = new Date();
+      await this.em.flush();
+      return { ok: true };
+    }
+
+    throw new ConflictException('Article is currently locked by another user');
+  }
+
+  async heartbeatLock(userId: number, slug: string) {
+    const article = await this.articleRepository.findOneOrFail({ slug });
+    const lock = await this.lockRepository.findOne({ article: article.id }, { populate: ['lockedBy'] });
+    if (!lock) {
+      throw new ConflictException('No active lock');
+    }
+    if (this.isLockExpired(lock)) {
+      throw new ConflictException('Lock expired');
+    }
+    if (lock.lockedBy.id !== userId) {
+      throw new ConflictException('Article is currently locked by another user');
+    }
+    lock.lastSeenAt = new Date();
+    await this.em.flush();
+    return { ok: true };
+  }
+
+  async releaseLock(userId: number, slug: string) {
+    const article = await this.articleRepository.findOneOrFail({ slug });
+    const lock = await this.lockRepository.findOne({ article: article.id }, { populate: ['lockedBy'] });
+    if (!lock) {
+      return { ok: true };
+    }
+    if (lock.lockedBy.id !== userId) {
+      throw new ConflictException('Cannot release a lock you do not own');
+    }
+    await this.em.removeAndFlush(lock);
+    return { ok: true };
   }
 }
